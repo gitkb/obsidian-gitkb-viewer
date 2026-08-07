@@ -133,7 +133,6 @@
 
 .gitkb-graph-root {
   --gitkb-panel: color-mix(in srgb, var(--background-primary) 86%, var(--background-secondary));
-  --gitkb-graph-line: color-mix(in srgb, var(--text-muted) 30%, transparent);
   background:
     linear-gradient(90deg, color-mix(in srgb, var(--background-modifier-border) 18%, transparent) 1px, transparent 1px),
     linear-gradient(0deg, color-mix(in srgb, var(--background-modifier-border) 18%, transparent) 1px, transparent 1px),
@@ -192,7 +191,6 @@
   position: relative;
 }
 
-.gitkb-graph-svg,
 .gitkb-graph-canvas {
   cursor: grab;
   display: block;
@@ -201,7 +199,6 @@
   width: 100%;
 }
 
-.gitkb-graph-svg:active,
 .gitkb-graph-canvas:active {
   cursor: grabbing;
 }
@@ -260,69 +257,6 @@
 .gitkb-graph-detail-slug {
   color: var(--text-muted);
   font-size: var(--font-ui-smaller);
-}
-
-.gitkb-graph-edge {
-  opacity: 0.34;
-  pointer-events: none;
-  stroke: var(--gitkb-graph-line);
-  stroke-linecap: round;
-  stroke-width: 1.1;
-  transition: opacity 120ms ease;
-}
-
-.gitkb-graph-edge[data-rel="blocks"],
-.gitkb-graph-edge[data-rel="blocked_by"] {
-  stroke: #e66b5b;
-}
-
-.gitkb-graph-edge[data-rel="implements"] {
-  stroke: #d6a84f;
-}
-
-.gitkb-graph-node {
-  cursor: pointer;
-  filter: drop-shadow(0 2px 5px color-mix(in srgb, var(--background-primary) 80%, transparent));
-  opacity: 0.92;
-  stroke: color-mix(in srgb, var(--background-primary) 80%, white);
-  stroke-width: 1.4;
-  transition: opacity 120ms ease, stroke-width 120ms ease, filter 120ms ease;
-}
-
-.gitkb-graph-node:hover,
-.gitkb-graph-node.is-hovered {
-  filter: drop-shadow(0 0 8px color-mix(in srgb, white 52%, transparent));
-  opacity: 1;
-  stroke: var(--text-normal);
-  stroke-width: 2.2;
-}
-
-.gitkb-graph-node.is-selected {
-  filter: drop-shadow(0 0 12px color-mix(in srgb, #d6a84f 65%, transparent));
-  stroke: #d6a84f;
-  stroke-width: 3;
-}
-
-.gitkb-graph-node.is-dimmed,
-.gitkb-graph-edge.is-dimmed {
-  opacity: 0.08;
-}
-
-.gitkb-graph-node.is-matched {
-  opacity: 1;
-  stroke: #ffffff;
-  stroke-width: 2.4;
-}
-
-.gitkb-graph-label {
-  fill: var(--text-normal);
-  font-size: 11px;
-  font-weight: 650;
-  paint-order: stroke;
-  pointer-events: none;
-  stroke: var(--background-primary);
-  stroke-linejoin: round;
-  stroke-width: 4px;
 }
 
 .gitkb-graph-detail-title {
