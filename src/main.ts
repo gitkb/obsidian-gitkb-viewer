@@ -104,10 +104,17 @@ interface GitKbMergedGraph {
   documentCount: number;
 }
 
+/** `git-kb` exits 10 when a requested document does not exist. */
+const GITKB_EXIT_NOT_FOUND = 10;
+
 class GitKbReadonlyError extends Error {
-  constructor(message: string) {
+  /** Process exit code, when the failure came from running `git-kb`. */
+  readonly exitCode: number | null;
+
+  constructor(message: string, exitCode: number | null = null) {
     super(message);
     this.name = "GitKbReadonlyError";
+    this.exitCode = exitCode;
   }
 }
 
@@ -148,11 +155,11 @@ class GitKbClient {
     try {
       response = (await this.runJson(["show", cleanSlug, "--json"])) as GitKbShowResponse;
     } catch (error) {
-      // `git-kb show` on an unknown slug exits nonzero with the diagnosis on
-      // stderr and empty stdout, so translate that into the domain error rather
-      // than leaking a subprocess failure dump.
-      if (error instanceof GitKbReadonlyError && /not found/i.test(error.message)) {
-        throw new GitKbReadonlyError(`GitKB document not found: ${cleanSlug}`);
+      // `git-kb show` on an unknown slug exits 10 with the diagnosis on stderr
+      // and empty stdout. Branch on the exit code rather than matching message
+      // text, which changes with CLI wording.
+      if (error instanceof GitKbReadonlyError && error.exitCode === GITKB_EXIT_NOT_FOUND) {
+        throw new GitKbReadonlyError(`GitKB document not found: ${cleanSlug}`, error.exitCode);
       }
       throw error;
     }
@@ -242,7 +249,8 @@ class GitKbClient {
       });
       return stdout;
     } catch (error) {
-      throw new GitKbReadonlyError(describeExecFailure(settings.gitKbPath, args, error));
+      const { message, exitCode } = describeExecFailure(settings.gitKbPath, args, error);
+      throw new GitKbReadonlyError(message, exitCode);
     }
   }
 
@@ -266,26 +274,36 @@ class GitKbClient {
  * document exits 10 with empty stdout). Node's default rejection message is
  * "Command failed: ..." which buries the actual diagnosis, so prefer stderr.
  */
-function describeExecFailure(binary: string, args: string[], error: unknown): string {
+function describeExecFailure(
+  binary: string,
+  args: string[],
+  error: unknown
+): { message: string; exitCode: number | null } {
   const detail = error as { stderr?: unknown; code?: unknown; signal?: unknown; killed?: unknown };
   const stderr = typeof detail?.stderr === "string" ? detail.stderr.trim() : "";
   const command = `${binary} ${args.join(" ")}`;
+  // execFile puts the process exit status in `code` on failure, but reuses the
+  // same field for spawn errors like "ENOENT" — so only a number is an exit code.
+  const exitCode = typeof detail?.code === "number" ? detail.code : null;
 
   if (detail?.killed && detail?.signal) {
-    return `GitKB command timed out (signal ${String(detail.signal)}):\n${command}`;
+    return { message: `GitKB command timed out (signal ${String(detail.signal)}):\n${command}`, exitCode };
   }
 
   if (stderr) {
-    const exit = typeof detail.code === "number" ? ` (exit ${detail.code})` : "";
-    return `${stderr}\n\nCommand${exit}: ${command}`;
+    const exit = exitCode === null ? "" : ` (exit ${exitCode})`;
+    return { message: `${stderr}\n\nCommand${exit}: ${command}`, exitCode };
   }
 
   if (detail?.code === "ENOENT") {
-    return `Could not find the git-kb binary: ${binary}\nSet an absolute path in GitKB Viewer settings.`;
+    return {
+      message: `Could not find the git-kb binary: ${binary}\nSet an absolute path in GitKB Viewer settings.`,
+      exitCode: null
+    };
   }
 
   const message = error instanceof Error ? error.message : String(error);
-  return `Failed to run read-only GitKB command:\n${command}\n\n${message}`;
+  return { message: `Failed to run read-only GitKB command:\n${command}\n\n${message}`, exitCode };
 }
 
 function assertAllowedGitKbArgs(args: string[]): void {
@@ -305,11 +323,20 @@ function assertAllowedGitKbArgs(args: string[]): void {
     rest[1] === "--limit" &&
     /^[1-9][0-9]*$/.test(rest[2]) &&
     rest[3] === "--json";
+  // show <slug> --json — same positional rule as search/graph. The client also
+  // calls rejectFlagLikeValue, but the allowlist is the defense-in-depth layer
+  // and must enforce the guarantee the README documents on its own.
+  const showArgs =
+    command === "show" &&
+    rest.length === 2 &&
+    Boolean(rest[0].trim()) &&
+    !rest[0].startsWith("-") &&
+    rest[1] === "--json";
   const ok =
     (command === "--version" && rest.length === 0) ||
     (command === "list" && rest.length === 1 && rest[0] === "--json") ||
     (command === "board" && rest.length === 1 && rest[0] === "--json") ||
-    (command === "show" && rest.length === 2 && rest[1] === "--json") ||
+    showArgs ||
     searchArgs ||
     graphArgs;
 
@@ -684,17 +711,22 @@ class GitKbExplorerView extends ItemView {
       const query = this.searchInput?.getValue().trim() ?? "";
       if (query) {
         const result = await this.plugin.client.search(query);
-        this.renderDocuments(result.documents, query, result.total);
+        this.renderDocuments(result.documents, query, result.total, result.truncated);
       } else {
         const docs = await this.plugin.client.list();
-        this.renderDocuments(docs, query, docs.length);
+        this.renderDocuments(docs, query, docs.length, false);
       }
     } catch (error) {
       renderError(this.listEl, error);
     }
   }
 
-  private renderDocuments(documents: GitKbListDocument[], query: string, total: number): void {
+  private renderDocuments(
+    documents: GitKbListDocument[],
+    query: string,
+    total: number,
+    truncated: boolean
+  ): void {
     if (!this.listEl) {
       return;
     }
@@ -711,7 +743,7 @@ class GitKbExplorerView extends ItemView {
     const summary = this.listEl.createDiv({ cls: "gitkb-viewer-doc-meta" });
     if (!query) {
       summary.setText(`${documents.length} document(s)`);
-    } else if (total > documents.length) {
+    } else if (truncated) {
       // Never imply the result set is complete when the KB has more matches.
       summary.setText(`Showing ${documents.length} of ${total} search result(s) — refine your query to narrow it.`);
     } else {
@@ -966,6 +998,7 @@ class GitKbGraphView extends ItemView {
   private scale = 1;
   private pointerStart: { x: number; y: number; panX: number; panY: number } | null = null;
   private ticksRemaining = 0;
+  private onSettled: (() => void) | null = null;
 
   constructor(
     leaf: WorkspaceLeaf,
@@ -1065,10 +1098,13 @@ class GitKbGraphView extends ItemView {
       this.prepareGraph(graph);
       this.renderStats(graph);
       this.applyFilter();
+      // Frame the seeded layout so the first painted frame is on-screen, then
+      // relax the ring seed into a relationship-driven layout. Without the
+      // simulation the graph is a static decorative spiral (tasks/harmony-1159).
       this.fitGraph();
-      // Relax the seeded ring layout into a relationship-driven one. Without
-      // this the graph is a static decorative spiral (see tasks/harmony-1159).
-      this.runSimulation(SIMULATION_TICKS);
+      // Refit once the tick budget drains: settling shrinks the layout, so
+      // framing computed against the seed leaves the graph zoomed too far out.
+      this.runSimulation(SIMULATION_TICKS, () => this.fitGraph());
     } catch (error) {
       if (this.statsEl) {
         renderError(this.statsEl, error);
@@ -1372,10 +1408,16 @@ class GitKbGraphView extends ItemView {
 
   /**
    * Queue simulation ticks and ensure the animation loop is running. Idempotent:
-   * calling it while the loop is live only extends the tick budget.
+   * calling it while the loop is live only extends the tick budget. `onSettled`
+   * fires once when the budget drains — it is retained even if the loop is
+   * already running, so a caller that needs post-settle work never loses it.
+   * It does not fire if the simulation is stopped early (e.g. view close).
    */
-  private runSimulation(ticks: number): void {
+  private runSimulation(ticks: number, onSettled?: () => void): void {
     this.ticksRemaining = Math.max(this.ticksRemaining, ticks);
+    if (onSettled) {
+      this.onSettled = onSettled;
+    }
     if (this.animationFrame) {
       return;
     }
@@ -1386,12 +1428,16 @@ class GitKbGraphView extends ItemView {
         this.animationFrame = requestAnimationFrame(step);
       } else {
         this.animationFrame = 0;
+        const settled = this.onSettled;
+        this.onSettled = null;
+        settled?.();
       }
     };
     this.animationFrame = requestAnimationFrame(step);
   }
 
   private stopSimulation(): void {
+    this.onSettled = null;
     if (this.animationFrame) {
       cancelAnimationFrame(this.animationFrame);
       this.animationFrame = 0;

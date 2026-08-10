@@ -9,8 +9,8 @@ documents.
 ## Features
 
 - GitKB Explorer side pane powered by `git-kb list --json`
-- Search UI powered by `git-kb search <query> --json`, fetching up to 500
-  matches and reporting the true total when the KB has more
+- Search UI powered by `git-kb search <query> --limit 500 --json`, reporting the
+  true total when the KB has more matches than were fetched
 - Readonly document view powered by `git-kb show <slug> --json`
 - All-KB graph view powered by `git-kb graph <slug...> --json`
 - `[[slug]]` wikilinks open readonly GitKB document views
@@ -38,8 +38,8 @@ It never calls `checkout`, `commit`, `create`, `set`, `rm`, `mv`, `reset`,
 
 ## Requirements
 
-- Obsidian desktop (this plugin shells out to `git-kb`, so it is
-  `isDesktopOnly`)
+- Obsidian 1.5.0 or later, desktop only (this plugin shells out to `git-kb`, so
+  it is `isDesktopOnly`)
 - A `git-kb` binary on `PATH`, or an absolute path set in settings
 - A directory containing a GitKB instance (a `.kb` directory)
 
