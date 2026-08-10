@@ -23,12 +23,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Gonzih/obsidian-gitkb-viewer.git"
+    "url": "git+https://github.com/gitkb/obsidian-gitkb-viewer.git"
   },
   "bugs": {
-    "url": "https://github.com/Gonzih/obsidian-gitkb-viewer/issues"
+    "url": "https://github.com/gitkb/obsidian-gitkb-viewer/issues"
   },
-  "homepage": "https://github.com/Gonzih/obsidian-gitkb-viewer#readme",
+  "homepage": "https://github.com/gitkb/obsidian-gitkb-viewer#readme",
   "files": [
     "main.js",
     "manifest.json",

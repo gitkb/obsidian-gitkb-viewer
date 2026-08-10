@@ -57,6 +57,27 @@ interface GitKbShowResponse {
   not_found?: string[];
 }
 
+interface GitKbPagination {
+  limit?: number | null;
+  offset?: number | null;
+  count?: number | null;
+  total?: number | null;
+  has_more?: boolean | null;
+}
+
+interface GitKbSearchResult {
+  documents: GitKbListDocument[];
+  total: number;
+  truncated: boolean;
+}
+
+/**
+ * Upper bound on documents pulled for a single search. `git-kb search` defaults
+ * to a 20-row page, so an unbounded query looks empty on a large KB. We ask for
+ * a large page and report honestly when the KB has more than we fetched.
+ */
+const SEARCH_FETCH_LIMIT = 500;
+
 type GitKbJson = unknown;
 
 interface GitKbGraphNode extends GitKbListDocument {
@@ -83,10 +104,17 @@ interface GitKbMergedGraph {
   documentCount: number;
 }
 
+/** `git-kb` exits 10 when a requested document does not exist. */
+const GITKB_EXIT_NOT_FOUND = 10;
+
 class GitKbReadonlyError extends Error {
-  constructor(message: string) {
+  /** Process exit code, when the failure came from running `git-kb`. */
+  readonly exitCode: number | null;
+
+  constructor(message: string, exitCode: number | null = null) {
     super(message);
     this.name = "GitKbReadonlyError";
+    this.exitCode = exitCode;
   }
 }
 
@@ -102,19 +130,39 @@ class GitKbClient {
     return extractDocuments(await this.runJson(["list", "--json"]));
   }
 
-  async search(query: string): Promise<GitKbListDocument[]> {
+  async search(query: string): Promise<GitKbSearchResult> {
     const cleanQuery = query.trim();
     if (!cleanQuery) {
-      return [];
+      return { documents: [], total: 0, truncated: false };
     }
     this.rejectFlagLikeValue(cleanQuery, "search query");
-    return extractDocuments(await this.runJson(["search", cleanQuery, "--json"]));
+    const json = await this.runJson([
+      "search",
+      cleanQuery,
+      "--limit",
+      String(SEARCH_FETCH_LIMIT),
+      "--json"
+    ]);
+    const documents = extractDocuments(json);
+    const total = extractSearchTotal(json) ?? documents.length;
+    return { documents, total, truncated: total > documents.length };
   }
 
   async show(slug: string): Promise<GitKbDocument> {
     const cleanSlug = normalizeSlug(slug);
     this.rejectFlagLikeValue(cleanSlug, "slug");
-    const response = (await this.runJson(["show", cleanSlug, "--json"])) as GitKbShowResponse;
+    let response: GitKbShowResponse;
+    try {
+      response = (await this.runJson(["show", cleanSlug, "--json"])) as GitKbShowResponse;
+    } catch (error) {
+      // `git-kb show` on an unknown slug exits 10 with the diagnosis on stderr
+      // and empty stdout. Branch on the exit code rather than matching message
+      // text, which changes with CLI wording.
+      if (error instanceof GitKbReadonlyError && error.exitCode === GITKB_EXIT_NOT_FOUND) {
+        throw new GitKbReadonlyError(`GitKB document not found: ${cleanSlug}`, error.exitCode);
+      }
+      throw error;
+    }
     const doc = response.documents?.[0];
     if (!doc) {
       throw new GitKbReadonlyError(`GitKB document not found: ${cleanSlug}`);
@@ -201,10 +249,8 @@ class GitKbClient {
       });
       return stdout;
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      throw new GitKbReadonlyError(
-        `Failed to run read-only GitKB command:\n${settings.gitKbPath} ${args.join(" ")}\n\n${message}`
-      );
+      const { message, exitCode } = describeExecFailure(settings.gitKbPath, args, error);
+      throw new GitKbReadonlyError(message, exitCode);
     }
   }
 
@@ -223,6 +269,43 @@ class GitKbClient {
   }
 }
 
+/**
+ * `git-kb` reports failures on stderr with a nonzero exit code (a missing
+ * document exits 10 with empty stdout). Node's default rejection message is
+ * "Command failed: ..." which buries the actual diagnosis, so prefer stderr.
+ */
+function describeExecFailure(
+  binary: string,
+  args: string[],
+  error: unknown
+): { message: string; exitCode: number | null } {
+  const detail = error as { stderr?: unknown; code?: unknown; signal?: unknown; killed?: unknown };
+  const stderr = typeof detail?.stderr === "string" ? detail.stderr.trim() : "";
+  const command = `${binary} ${args.join(" ")}`;
+  // execFile puts the process exit status in `code` on failure, but reuses the
+  // same field for spawn errors like "ENOENT" — so only a number is an exit code.
+  const exitCode = typeof detail?.code === "number" ? detail.code : null;
+
+  if (detail?.killed && detail?.signal) {
+    return { message: `GitKB command timed out (signal ${String(detail.signal)}):\n${command}`, exitCode };
+  }
+
+  if (stderr) {
+    const exit = exitCode === null ? "" : ` (exit ${exitCode})`;
+    return { message: `${stderr}\n\nCommand${exit}: ${command}`, exitCode };
+  }
+
+  if (detail?.code === "ENOENT") {
+    return {
+      message: `Could not find the git-kb binary: ${binary}\nSet an absolute path in GitKB Viewer settings.`,
+      exitCode: null
+    };
+  }
+
+  const message = error instanceof Error ? error.message : String(error);
+  return { message: `Failed to run read-only GitKB command:\n${command}\n\n${message}`, exitCode };
+}
+
 function assertAllowedGitKbArgs(args: string[]): void {
   const [command, ...rest] = args;
   const graphArgs =
@@ -230,12 +313,31 @@ function assertAllowedGitKbArgs(args: string[]): void {
     rest.length >= 2 &&
     rest[rest.length - 1] === "--json" &&
     rest.slice(0, -1).every((arg) => Boolean(arg.trim()) && !arg.startsWith("-"));
+  // search <query> --limit <n> --json — the query is positional and must not
+  // look like a flag; the limit must be a bare positive integer.
+  const searchArgs =
+    command === "search" &&
+    rest.length === 4 &&
+    Boolean(rest[0].trim()) &&
+    !rest[0].startsWith("-") &&
+    rest[1] === "--limit" &&
+    /^[1-9][0-9]*$/.test(rest[2]) &&
+    rest[3] === "--json";
+  // show <slug> --json — same positional rule as search/graph. The client also
+  // calls rejectFlagLikeValue, but the allowlist is the defense-in-depth layer
+  // and must enforce the guarantee the README documents on its own.
+  const showArgs =
+    command === "show" &&
+    rest.length === 2 &&
+    Boolean(rest[0].trim()) &&
+    !rest[0].startsWith("-") &&
+    rest[1] === "--json";
   const ok =
     (command === "--version" && rest.length === 0) ||
     (command === "list" && rest.length === 1 && rest[0] === "--json") ||
     (command === "board" && rest.length === 1 && rest[0] === "--json") ||
-    (command === "show" && rest.length === 2 && rest[1] === "--json") ||
-    (command === "search" && rest.length === 2 && rest[1] === "--json") ||
+    showArgs ||
+    searchArgs ||
     graphArgs;
 
   if (!ok) {
@@ -279,8 +381,7 @@ function mergeGraphResponses(
       if (!edge.from || !edge.to || edge.from === edge.to) {
         continue;
       }
-      const key = `${edge.from}\u0000${edge.to}\u0000${edge.rel_type || "edge"}`;
-      edges.set(key, edge);
+      edges.set(graphEdgeKey(edge), edge);
     }
   }
 
@@ -328,6 +429,18 @@ function extractDocuments(json: GitKbJson): GitKbListDocument[] {
   }
 
   return [];
+}
+
+function extractSearchTotal(json: GitKbJson): number | null {
+  if (!json || typeof json !== "object") {
+    return null;
+  }
+  const pagination = (json as { pagination?: unknown }).pagination;
+  if (!pagination || typeof pagination !== "object") {
+    return null;
+  }
+  const total = (pagination as GitKbPagination).total;
+  return typeof total === "number" && Number.isFinite(total) ? total : null;
 }
 
 function isDocumentLike(value: unknown): value is GitKbListDocument {
@@ -596,16 +709,24 @@ class GitKbExplorerView extends ItemView {
     renderLoading(this.listEl);
     try {
       const query = this.searchInput?.getValue().trim() ?? "";
-      const docs = query
-        ? await this.plugin.client.search(query)
-        : await this.plugin.client.list();
-      this.renderDocuments(docs, query);
+      if (query) {
+        const result = await this.plugin.client.search(query);
+        this.renderDocuments(result.documents, query, result.total, result.truncated);
+      } else {
+        const docs = await this.plugin.client.list();
+        this.renderDocuments(docs, query, docs.length, false);
+      }
     } catch (error) {
       renderError(this.listEl, error);
     }
   }
 
-  private renderDocuments(documents: GitKbListDocument[], query: string): void {
+  private renderDocuments(
+    documents: GitKbListDocument[],
+    query: string,
+    total: number,
+    truncated: boolean
+  ): void {
     if (!this.listEl) {
       return;
     }
@@ -620,7 +741,14 @@ class GitKbExplorerView extends ItemView {
     }
 
     const summary = this.listEl.createDiv({ cls: "gitkb-viewer-doc-meta" });
-    summary.setText(query ? `${documents.length} search result(s)` : `${documents.length} document(s)`);
+    if (!query) {
+      summary.setText(`${documents.length} document(s)`);
+    } else if (truncated) {
+      // Never imply the result set is complete when the KB has more matches.
+      summary.setText(`Showing ${documents.length} of ${total} search result(s) — refine your query to narrow it.`);
+    } else {
+      summary.setText(`${documents.length} search result(s)`);
+    }
 
     for (const [type, docs] of groupByType(documents)) {
       const groupEl = this.listEl.createDiv({ cls: "gitkb-viewer-group" });
@@ -845,17 +973,15 @@ interface ForceEdge extends GitKbGraphEdge {
   target: ForceNode;
 }
 
-const SVG_NS = "http://www.w3.org/2000/svg";
+/** Simulation ticks queued after a fresh load; also the alpha decay horizon. */
+const SIMULATION_TICKS = 340;
+/** Ticks queued after a user interaction that perturbs the layout. */
+const NUDGE_TICKS = 90;
 
 class GitKbGraphView extends ItemView {
   private graphRoot: HTMLElement | null = null;
   private canvas: HTMLCanvasElement | null = null;
   private ctx: CanvasRenderingContext2D | null = null;
-  private svg: SVGSVGElement | null = null;
-  private viewport: SVGGElement | null = null;
-  private edgeLayer: SVGGElement | null = null;
-  private nodeLayer: SVGGElement | null = null;
-  private labelLayer: SVGGElement | null = null;
   private statsEl: HTMLElement | null = null;
   private detailEl: HTMLElement | null = null;
   private searchInput: TextComponent | null = null;
@@ -863,7 +989,6 @@ class GitKbGraphView extends ItemView {
   private nodes: ForceNode[] = [];
   private edges: ForceEdge[] = [];
   private nodeById = new Map<string, ForceNode>();
-  private edgeByKey = new Map<string, ForceEdge>();
   private matchedNodeIds = new Set<string>();
   private selectedNode: ForceNode | null = null;
   private hoveredNode: ForceNode | null = null;
@@ -873,6 +998,7 @@ class GitKbGraphView extends ItemView {
   private scale = 1;
   private pointerStart: { x: number; y: number; panX: number; panY: number } | null = null;
   private ticksRemaining = 0;
+  private onSettled: (() => void) | null = null;
 
   constructor(
     leaf: WorkspaceLeaf,
@@ -971,8 +1097,14 @@ class GitKbGraphView extends ItemView {
       const graph = await this.plugin.client.allGraph();
       this.prepareGraph(graph);
       this.renderStats(graph);
+      this.applyFilter();
+      // Frame the seeded layout so the first painted frame is on-screen, then
+      // relax the ring seed into a relationship-driven layout. Without the
+      // simulation the graph is a static decorative spiral (tasks/harmony-1159).
       this.fitGraph();
-      this.drawCanvasGraph();
+      // Refit once the tick budget drains: settling shrinks the layout, so
+      // framing computed against the seed leaves the graph zoomed too far out.
+      this.runSimulation(SIMULATION_TICKS, () => this.fitGraph());
     } catch (error) {
       if (this.statsEl) {
         renderError(this.statsEl, error);
@@ -1050,7 +1182,6 @@ class GitKbGraphView extends ItemView {
         return { ...edge, source, target };
       })
       .filter((edge): edge is ForceEdge => edge !== null);
-    this.edgeByKey = new Map(this.edges.map((edge) => [graphEdgeKey(edge), edge]));
   }
 
   private renderStats(graph: GitKbMergedGraph): void {
@@ -1089,7 +1220,10 @@ class GitKbGraphView extends ItemView {
     const ctx = this.ctx;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, width, height);
-    ctx.fillStyle = getComputedStyle(this.canvas).getPropertyValue("--background-primary") || "transparent";
+
+    const themeStyle = getComputedStyle(this.canvas);
+    const haloColor = themeStyle.getPropertyValue("--background-primary").trim() || "#000000";
+    const textColor = themeStyle.getPropertyValue("--text-normal").trim() || "#ffffff";
 
     const query = this.searchInput?.getValue().trim() ?? "";
     const hasFilter = query.length > 0;
@@ -1141,13 +1275,15 @@ class GitKbGraphView extends ItemView {
     ctx.font = `${Math.max(10 / this.scale, 10)}px sans-serif`;
     ctx.textBaseline = "middle";
     ctx.lineJoin = "round";
+    // Resolve theme colors once per frame — getComputedStyle forces a style
+    // recalc, and calling it per label stalled panning on large graphs.
+    ctx.lineWidth = 4 / this.scale;
+    ctx.strokeStyle = haloColor;
+    ctx.fillStyle = textColor;
     for (const node of labelNodes) {
       const label = node.title || node.slug;
       const x = node.x + node.radius + 5 / this.scale;
       const y = node.y;
-      ctx.lineWidth = 4 / this.scale;
-      ctx.strokeStyle = getComputedStyle(this.canvas).getPropertyValue("--background-primary") || "#000000";
-      ctx.fillStyle = getComputedStyle(this.canvas).getPropertyValue("--text-normal") || "#ffffff";
       ctx.strokeText(label, x, y);
       ctx.fillText(label, x, y);
     }
@@ -1197,6 +1333,10 @@ class GitKbGraphView extends ItemView {
         const point = this.screenToGraph(event.clientX, event.clientY);
         this.draggedNode.x = point.x;
         this.draggedNode.y = point.y;
+        this.draggedNode.vx = 0;
+        this.draggedNode.vy = 0;
+        // Let neighbours follow the dragged node instead of freezing mid-layout.
+        this.runSimulation(NUDGE_TICKS);
         this.drawCanvasGraph();
         return;
       }
@@ -1246,7 +1386,8 @@ class GitKbGraphView extends ItemView {
     const query = this.searchInput?.getValue().trim() ?? "";
     const hasFilter = query.length > 0;
     let best: ForceNode | null = null;
-    let bestDistance = Number.POSITIVE_INFINITY;
+    // Compared in squared space throughout to avoid per-node sqrt.
+    let bestDistanceSquared = Number.POSITIVE_INFINITY;
 
     for (const node of this.nodes) {
       if (hasFilter && !this.matchedNodeIds.has(node.id)) {
@@ -1255,150 +1396,58 @@ class GitKbGraphView extends ItemView {
       const dx = point.x - node.x;
       const dy = point.y - node.y;
       const limit = node.radius + 7 / this.scale;
-      const distance = dx * dx + dy * dy;
-      if (distance <= limit * limit && distance < bestDistance) {
+      const distanceSquared = dx * dx + dy * dy;
+      if (distanceSquared <= limit * limit && distanceSquared < bestDistanceSquared) {
         best = node;
-        bestDistance = distance;
+        bestDistanceSquared = distanceSquared;
       }
     }
 
     return best;
   }
 
-  private renderSvgGraph(): void {
-    if (!this.edgeLayer || !this.nodeLayer || !this.labelLayer) {
+  /**
+   * Queue simulation ticks and ensure the animation loop is running. Idempotent:
+   * calling it while the loop is live only extends the tick budget. `onSettled`
+   * fires once when the budget drains — it is retained even if the loop is
+   * already running, so a caller that needs post-settle work never loses it.
+   * It does not fire if the simulation is stopped early (e.g. view close).
+   */
+  private runSimulation(ticks: number, onSettled?: () => void): void {
+    this.ticksRemaining = Math.max(this.ticksRemaining, ticks);
+    if (onSettled) {
+      this.onSettled = onSettled;
+    }
+    if (this.animationFrame) {
       return;
     }
-    this.edgeLayer.empty();
-    this.nodeLayer.empty();
-    this.labelLayer.empty();
-
-    for (const edge of this.edges) {
-      const line = document.createElementNS(SVG_NS, "line");
-      line.addClass("gitkb-graph-edge");
-      line.setAttribute("data-from", edge.from);
-      line.setAttribute("data-to", edge.to);
-      line.setAttribute("data-rel", edge.rel_type || "edge");
-      line.setAttribute("data-key", graphEdgeKey(edge));
-      this.edgeLayer.appendChild(line);
-    }
-
-    for (const node of this.nodes) {
-      const circle = document.createElementNS(SVG_NS, "circle");
-      circle.addClass("gitkb-graph-node");
-      circle.setAttribute("r", String(node.radius));
-      circle.setAttribute("fill", colorForType(node.type));
-      circle.setAttribute("data-id", node.id);
-      circle.setAttribute("tabindex", "0");
-      const title = document.createElementNS(SVG_NS, "title");
-      title.textContent = `${node.title || node.slug}\n${node.slug}`;
-      circle.appendChild(title);
-      circle.addEventListener("mouseenter", () => {
-        this.hoveredNode = node;
-        this.updateLabels();
-      });
-      circle.addEventListener("mouseleave", () => {
-        this.hoveredNode = null;
-        this.updateLabels();
-      });
-      circle.addEventListener("pointerdown", (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        this.draggedNode = node;
-        this.selectedNode = node;
-        this.renderDetails(node);
-        circle.setPointerCapture(event.pointerId);
-      });
-      circle.addEventListener("pointermove", (event) => {
-        if (this.draggedNode !== node) {
-          return;
-        }
-        const point = this.screenToGraph(event.clientX, event.clientY);
-        node.x = point.x;
-        node.y = point.y;
-        node.vx = 0;
-        node.vy = 0;
-        this.ticksRemaining = Math.max(this.ticksRemaining, 80);
-        this.updatePositions();
-      });
-      circle.addEventListener("pointerup", (event) => {
-        if (this.draggedNode === node) {
-          this.draggedNode = null;
-          circle.releasePointerCapture(event.pointerId);
-        }
-      });
-      circle.addEventListener("dblclick", (event) => {
-        event.preventDefault();
-        void this.plugin.openDocument(node.slug);
-      });
-      this.nodeLayer.appendChild(circle);
-    }
-
-    this.updatePositions();
-    this.applyFilter();
-  }
-
-  private registerGraphEvents(): void {
-    if (!this.svg) {
-      return;
-    }
-
-    this.svg.addEventListener("wheel", (event) => {
-      event.preventDefault();
-      const direction = event.deltaY > 0 ? 0.9 : 1.1;
-      this.scale = Math.max(0.08, Math.min(5, this.scale * direction));
-      this.applyTransform();
-    }, { passive: false });
-
-    this.svg.addEventListener("pointerdown", (event) => {
-      if (event.target !== this.svg) {
-        return;
-      }
-      this.pointerStart = {
-        x: event.clientX,
-        y: event.clientY,
-        panX: this.panX,
-        panY: this.panY
-      };
-      this.svg?.setPointerCapture(event.pointerId);
-    });
-
-    this.svg.addEventListener("pointermove", (event) => {
-      if (!this.pointerStart) {
-        return;
-      }
-      this.panX = this.pointerStart.panX + event.clientX - this.pointerStart.x;
-      this.panY = this.pointerStart.panY + event.clientY - this.pointerStart.y;
-      this.applyTransform();
-    });
-
-    this.svg.addEventListener("pointerup", (event) => {
-      this.pointerStart = null;
-      this.svg?.releasePointerCapture(event.pointerId);
-    });
-  }
-
-  private startSimulation(): void {
     const step = () => {
       this.tick();
-      this.updatePositions();
+      this.drawCanvasGraph();
       if (this.ticksRemaining > 0) {
         this.animationFrame = requestAnimationFrame(step);
+      } else {
+        this.animationFrame = 0;
+        const settled = this.onSettled;
+        this.onSettled = null;
+        settled?.();
       }
     };
     this.animationFrame = requestAnimationFrame(step);
   }
 
   private stopSimulation(): void {
+    this.onSettled = null;
     if (this.animationFrame) {
       cancelAnimationFrame(this.animationFrame);
       this.animationFrame = 0;
     }
+    this.ticksRemaining = 0;
   }
 
   private tick(): void {
     this.ticksRemaining -= 1;
-    const alpha = Math.max(0.02, this.ticksRemaining / 340);
+    const alpha = Math.max(0.02, this.ticksRemaining / SIMULATION_TICKS);
     const sampleStep = this.nodes.length > 700 ? 7 : this.nodes.length > 420 ? 4 : 1;
 
     for (let index = 0; index < this.nodes.length; index += 1) {
@@ -1456,57 +1505,6 @@ class GitKbGraphView extends ItemView {
     }
   }
 
-  private updatePositions(): void {
-    if (!this.edgeLayer || !this.nodeLayer) {
-      return;
-    }
-
-    for (const line of Array.from(this.edgeLayer.children) as SVGLineElement[]) {
-      const edge = this.edgeByKey.get(line.getAttribute("data-key") || "");
-      if (!edge) {
-        continue;
-      }
-      line.setAttribute("x1", edge.source.x.toFixed(1));
-      line.setAttribute("y1", edge.source.y.toFixed(1));
-      line.setAttribute("x2", edge.target.x.toFixed(1));
-      line.setAttribute("y2", edge.target.y.toFixed(1));
-    }
-
-    for (const circle of Array.from(this.nodeLayer.children) as SVGCircleElement[]) {
-      const id = circle.getAttribute("data-id");
-      const node = id ? this.nodeById.get(id) : null;
-      if (!node) {
-        continue;
-      }
-      circle.setAttribute("cx", node.x.toFixed(1));
-      circle.setAttribute("cy", node.y.toFixed(1));
-      circle.toggleClass("is-selected", this.selectedNode?.id === node.id);
-      circle.toggleClass("is-hovered", this.hoveredNode?.id === node.id);
-    }
-
-    this.updateLabels();
-  }
-
-  private updateLabels(): void {
-    if (!this.labelLayer) {
-      return;
-    }
-    this.labelLayer.empty();
-    const important = this.nodes
-      .filter((node) => node === this.selectedNode || node === this.hoveredNode || node.degree >= 12)
-      .sort((a, b) => b.degree - a.degree)
-      .slice(0, 36);
-
-    for (const node of important) {
-      const label = document.createElementNS(SVG_NS, "text");
-      label.addClass("gitkb-graph-label");
-      label.setAttribute("x", String(node.x + node.radius + 5));
-      label.setAttribute("y", String(node.y + 4));
-      label.textContent = node.title || node.slug;
-      this.labelLayer.appendChild(label);
-    }
-  }
-
   private applyFilter(): void {
     const query = this.searchInput?.getValue().trim().toLowerCase() ?? "";
     this.matchedNodeIds = new Set<string>();
@@ -1561,15 +1559,41 @@ class GitKbGraphView extends ItemView {
       return;
     }
     const rect = this.canvas.getBoundingClientRect();
-    const maxX = Math.max(...this.nodes.map((node) => Math.abs(node.x) + node.radius));
-    const maxY = Math.max(...this.nodes.map((node) => Math.abs(node.y) + node.radius));
-    this.scale = Math.max(0.08, Math.min(1.5, Math.min(rect.width / Math.max(1, maxX * 2.3), rect.height / Math.max(1, maxY * 2.3))));
-    this.panX = rect.width / 2;
-    this.panY = rect.height / 2;
-    this.drawCanvasGraph();
-  }
+    if (rect.width === 0 || rect.height === 0) {
+      return;
+    }
 
-  private applyTransform(): void {
+    // True bounding box. The layout is not origin-centered (type clusters are
+    // ring-distributed and nodes can be dragged anywhere), so fitting on
+    // max(|x|) mis-centers the view. Iterate rather than spreading the node
+    // array into Math.max, which overflows the stack on large graphs.
+    let minX = Number.POSITIVE_INFINITY;
+    let minY = Number.POSITIVE_INFINITY;
+    let maxX = Number.NEGATIVE_INFINITY;
+    let maxY = Number.NEGATIVE_INFINITY;
+    for (const node of this.nodes) {
+      minX = Math.min(minX, node.x - node.radius);
+      minY = Math.min(minY, node.y - node.radius);
+      maxX = Math.max(maxX, node.x + node.radius);
+      maxY = Math.max(maxY, node.y + node.radius);
+    }
+
+    const padding = 40;
+    const spanX = Math.max(1, maxX - minX);
+    const spanY = Math.max(1, maxY - minY);
+    this.scale = Math.max(
+      0.05,
+      Math.min(
+        1.5,
+        Math.min(
+          (rect.width - padding * 2) / spanX,
+          (rect.height - padding * 2) / spanY
+        )
+      )
+    );
+    // Center the bounding box midpoint in the viewport.
+    this.panX = rect.width / 2 - ((minX + maxX) / 2) * this.scale;
+    this.panY = rect.height / 2 - ((minY + maxY) / 2) * this.scale;
     this.drawCanvasGraph();
   }
 
