@@ -92,7 +92,9 @@ function hasDocumentResultArray(value) {
 async function runReadOnlySmoke(kbRoot) {
   await runGitKb(["--version"], { kbRoot });
 
-  const docs = parseJson(await runGitKb(["list", "--json"], { kbRoot }), "list --json");
+  const listed = parseJson(await runGitKb(["list", "--json"], { kbRoot }), "list --json");
+  // `list --json` is a page object; older git-kb prints a bare array.
+  const docs = Array.isArray(listed) ? listed : listed?.documents;
   if (!Array.isArray(docs) || docs.length === 0 || typeof docs[0].slug !== "string") {
     throw new Error("Smoke list command did not return a document array with slugs.");
   }
